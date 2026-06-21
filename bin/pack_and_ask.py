@@ -924,49 +924,69 @@ def project_home_ok(page, url: str) -> bool:
         return False
 
 
+# 다국어(사용자 ChatGPT UI 언어) 베스트에포트 — '새 프로젝트' 버튼 / '만들기' 제출 버튼.
+_NEW_PROJECT_RE = r"새 프로젝트|New project|新規プロジェクト|プロジェクトを追加|Add project|Create project"
+_CREATE_SUBMIT_RE = r"프로젝트 만들기|Create project|プロジェクトを作成|^Create$|^作成$|^만들기$"
+
+
 def find_project_url(page, name: str) -> str | None:
-    """사이드바에서 동명 프로젝트의 홈 URL을 회수(SPA 라우팅). 없으면 None.
-    프로젝트 행은 <li>, 옵션버튼 aria-label='{이름} 프로젝트 옵션 열기'로 식별."""
-    # 프로젝트 목록이 DOM에 렌더될 때까지 잠깐 대기(지연 렌더 시 중복 생성 방지)
-    for _ in range(8):
-        if page.evaluate("""() => [...document.querySelectorAll('button[aria-label]')]
-                .some(b => /프로젝트 옵션 열기/.test(b.getAttribute('aria-label') || ''))"""):
-            break
-        time.sleep(0.5)
-    clicked = page.evaluate("""(nm) => {
-        const opt = [...document.querySelectorAll('button[aria-label]')]
-            .find(b => b.getAttribute('aria-label') === nm + ' 프로젝트 옵션 열기');
-        if (!opt) return false;
-        const li = opt.closest('li') || opt.parentElement;
-        const home = li && li.querySelector('button[aria-label="프로젝트 홈 열기"]');
-        const tgt = home || li;          // 홈 버튼 우선, 없으면 행 자체 클릭
-        if (tgt) { tgt.click(); return true; }
-        return false;
-    }""", name)
-    if not clicked:
-        return None
+    """사이드바에서 '표시 이름이 정확히 name'인 프로젝트의 홈 URL을 회수(SPA 라우팅). 없으면 None.
+    언어무관: 행(li)의 표시텍스트 == 이름으로 찾고(aria 로컬라이즈에 의존 안 함),
+    같은 행의 '이름이 안 들어간 버튼'(=홈 버튼; 옵션버튼 aria엔 이름이 들어감)을 클릭한다.
+    #2 대응: 목표가 보일 때까지 사이드바를 스크롤하며 폴링 → 가상화/지연으로 못 찾고 중복 생성하는 일 방지.
+    #3 대응: 어떤 예외도 삼켜 None 반환(폴백 가능)."""
     try:
-        page.wait_for_url("**/g/g-p-**", wait_until="commit", timeout=8000)
+        for _ in range(12):
+            clicked = page.evaluate("""(nm) => {
+                const lis = [...document.querySelectorAll('nav li, aside li, li')];
+                for (const li of lis) {
+                    const first = ((li.innerText || '').trim().split('\\n')[0] || '').trim();
+                    const btns = [...li.querySelectorAll('button[aria-label]')];
+                    if (first === nm && btns.length) {
+                        // 옵션버튼 aria엔 프로젝트명이 들어감 → 이름이 '안' 들어간 버튼이 홈(내비) 버튼
+                        const home = btns.find(b => !((b.getAttribute('aria-label') || '').includes(nm))) || btns[0];
+                        home.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""", name)
+            if clicked:
+                try:
+                    page.wait_for_url("**/g/g-p-**", wait_until="commit", timeout=8000)
+                except Exception:
+                    pass
+                time.sleep(1.2)
+                return page.url if "/g/g-p-" in page.url else None
+            # 가상화/접힘 대비: 스크롤 컨테이너를 끝까지 내려 더 로드한 뒤 재시도
+            page.evaluate("""() => { for (const el of document.querySelectorAll('nav *, aside *')) {
+                if (el.scrollHeight > el.clientHeight + 20) el.scrollTop = el.scrollHeight; } }""")
+            time.sleep(0.5)
     except Exception:
-        pass
-    time.sleep(1.5)
-    return page.url if "/g/g-p-" in page.url else None
+        return None
+    return None
 
 
 def create_project(page, name: str) -> str | None:
-    """'새 프로젝트' 모달로 폴더명 프로젝트 생성 → 홈 URL 반환. 실패 시 None(호출자 폴백)."""
-    opened = page.evaluate("""() => { const b = [...document.querySelectorAll('button[aria-label]')]
-        .find(x => /새 프로젝트/.test(x.getAttribute('aria-label') || '')); if (b) { b.click(); return true; } return false; }""")
+    """'새 프로젝트' 모달로 폴더명 프로젝트 생성 → 홈 URL 반환. 실패/미지원 시 None(호출자 폴백).
+    제출은 다국어 텍스트 매칭 → 실패하면 Enter 폴백(언어무관)."""
+    opened = page.evaluate("""(re) => { const rx = new RegExp(re, 'i');
+        const b = [...document.querySelectorAll('button[aria-label]')].find(x => rx.test(x.getAttribute('aria-label') || ''));
+        if (b) { b.click(); return true; } return false; }""", _NEW_PROJECT_RE)
     if not opened:
-        return None  # '새 프로젝트' 버튼 없음(프로젝트 미지원 플랜 등) → 일반 채팅으로 폴백
+        return None  # '새 프로젝트' 버튼 없음(프로젝트 미지원 플랜/언어 불일치) → 일반 채팅 폴백
     try:
         # 모달의 유일한 visible text-input = 이름칸(컴포저는 contenteditable이라 input[type=text] 아님)
         name_input = page.locator('input[type="text"]:visible').last
         name_input.wait_for(state="visible", timeout=8000)
         name_input.click()
-        name_input.fill(name)        # fill로 입력해야 '프로젝트 만들기' 버튼이 enabled 된다
+        name_input.fill(name)        # fill로 입력해야 제출 버튼이 enabled 된다
         time.sleep(0.4)
-        page.get_by_role("button", name="프로젝트 만들기", exact=True).click()
+        submitted = page.evaluate("""(re) => { const rx = new RegExp(re, 'i');
+            const btns = [...document.querySelectorAll('button')].filter(b => !b.disabled && rx.test((b.innerText || '').trim()));
+            if (btns.length) { btns[btns.length - 1].click(); return true; } return false; }""", _CREATE_SUBMIT_RE)
+        if not submitted:
+            name_input.press("Enter")  # 텍스트 매칭 실패 시 언어무관 폴백
         page.wait_for_url("**/g/g-p-**", wait_until="commit", timeout=15000)
         time.sleep(2)
         return page.url if "/g/g-p-" in page.url else None
@@ -978,24 +998,28 @@ def create_project(page, name: str) -> str | None:
         return None
 
 
-def ensure_project(page, name: str, cache_path: Path) -> str | None:
-    """폴더명 프로젝트의 홈 URL 확보: 캐시 → 사이드바 탐색 → 생성. 모두 실패하면 None.
-    캐시(per-repo `.insane-review/projects.json`)가 1순위라 평소엔 사이드바를 안 건드린다(견고)."""
-    cache = _load_project_cache(cache_path)
-    cached = cache.get(name)
-    if cached and project_home_ok(page, cached):
-        return cached
-    page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)  # 탐색/생성은 홈에서
-    time.sleep(2)
-    url = find_project_url(page, name)
-    if not url:
-        page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+def ensure_project(page, name: str, cache_key: str, cache_path: Path) -> str | None:
+    """프로젝트 홈 URL 확보: 캐시(절대경로 키) → 사이드바 탐색 → 생성.
+    #1 대응: 캐시 키는 '절대경로'(cache_key) — 같은 폴더명의 다른 경로가 캐시를 공유하지 않는다.
+    #3 대응: 함수 전체를 try/except로 감싸 어떤 예외도 None으로(호출자가 일반 채팅으로 폴백)."""
+    try:
+        cache = _load_project_cache(cache_path)
+        cached = cache.get(cache_key)
+        if cached and project_home_ok(page, cached):
+            return cached
+        page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)  # 탐색/생성은 홈에서
         time.sleep(2)
-        url = create_project(page, name)
-    if url:
-        cache[name] = url
-        _save_project_cache(cache_path, cache)
-    return url
+        url = find_project_url(page, name)
+        if not url:
+            page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
+            url = create_project(page, name)
+        if url:
+            cache[cache_key] = url
+            _save_project_cache(cache_path, cache)
+        return url
+    except Exception:
+        return None
 
 
 # ===========================================================================
@@ -1059,6 +1083,8 @@ def main():
     # 폴더명→프로젝트URL 캐시(per-repo) — 평소엔 사이드바 안 건드리고 바로 프로젝트로 goto
     project_cache_path = out_dir / "projects.json"
     project_name = args.project or Path.cwd().name
+    # #1: 캐시 키 = 절대경로::이름 — 동명 다른 폴더도, 같은 폴더의 다른 --project도 충돌하지 않음
+    project_cache_key = f"{Path.cwd().resolve()}::{project_name}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_tag = f"{ts}_{os.getpid()}_{uuid.uuid4().hex[:6]}"  # 동시 실행 충돌 방지
     pack_path = None
@@ -1134,19 +1160,36 @@ def main():
                         raise RuntimeError("ChatGPT 로그인 안 됨/입력창 없음 — 해당 브라우저에서 chatgpt.com 로그인 확인")
 
                     # 프로젝트 그룹핑(기본 on): 현재 폴더명 프로젝트로 채팅을 정리(일반 채팅목록 오염 방지).
-                    # 실패해도 하드중단 X — 일반 채팅으로 폴백(프로젝트 미지원 플랜/UI 변경에 안전).
+                    # 어떤 실패(예외 포함)에도 하드중단 X — 컴포저가 확인되는 일반 채팅으로 폴백(#3).
                     if not args.no_project:
-                        proj_url = ensure_project(page, project_name, project_cache_path)
+                        proj_url = ensure_project(page, project_name, project_cache_key, project_cache_path)
+                        entered = False
                         if proj_url:
-                            page.goto(proj_url, wait_until="load", timeout=60000)
-                            time.sleep(2)
-                            for _ in range(10):
-                                if find_input(page):
-                                    break
-                                time.sleep(1)
+                            try:
+                                page.goto(proj_url, wait_until="load", timeout=60000)
+                                time.sleep(2)
+                                for _ in range(10):
+                                    if find_input(page):
+                                        break
+                                    time.sleep(1)
+                                entered = find_input(page) is not None  # 컴포저 최종 확인
+                            except Exception as pexc:
+                                print(f"  ⚠️  프로젝트 진입 예외({str(pexc)[:50]})")
+                                entered = False
+                        if entered:
                             print(f"  🗂  프로젝트 '{project_name}'에 채팅 정리 → {proj_url}")
                         else:
-                            print(f"  ⚠️  프로젝트 '{project_name}' 확보 실패 → 일반 채팅으로 진행(폴백)")
+                            # 폴백: 프로젝트 미확보/진입 실패 모두 일반 채팅으로(컴포저 보장)
+                            print(f"  ⚠️  프로젝트 '{project_name}' 사용 불가 → 일반 채팅으로 진행(폴백)")
+                            try:
+                                page.goto(CHATGPT_URL, wait_until="load", timeout=60000)
+                                time.sleep(2)
+                                for _ in range(10):
+                                    if find_input(page):
+                                        break
+                                    time.sleep(1)
+                            except Exception:
+                                pass
 
                     print(f"  현재 pill: {read_model_pills(page)}")
                     if args.model:
