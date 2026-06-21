@@ -10,7 +10,22 @@ description: GPT-5.5 Pro(웹 전용)에게 repomix로 패킹한 코드/질문을
 > 필요한 결정은 **AskUserQuestion 선택지**로 물어본 뒤 Claude가 대신 실행한다. 초보자도 클릭만으로 따라올 수 있어야 한다.
 > (AskUserQuestion은 frontmatter `allowed-tools`에 **절대 넣지 않는다** — 넣으면 자동승인돼 UI가 안 뜬다.)
 
-## Step 0 — 환경 온보딩 (선택지 기반, 막힌 단계만)
+## Step 0 — 첫 실행 셋업 (1회, 자동)
+
+가장 먼저 실행한다 — 부트스트랩: 업데이트 알림 훅 설치 + Python 의존성(pyperclip·playwright) 자동 설치. (repomix는 `npx -y`로 실행되어 사전설치 불필요.)
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/setup/setup.sh"
+```
+
+출력이 `STAR_ASK`로 시작하면 즉시 **AskUserQuestion**을 1회 호출한다 — 질문·선택지는 **사용자의 현재 대화 언어**로 작성한다(대화 언어가 분명하면 그것을, 아니면 `STAR_ASK` 뒤 언어코드 `ko/ja/en`을 사용; 무조건 한국어 기본값 금지).
+- header: 짧은 현지화된 "GitHub Star" 라벨
+- question: 이 플러그인(과 gptaku-plugins 마켓플레이스)에 GitHub ⭐로 응원할지 — 선택 안 해도 모든 기능은 그대로 작동
+- options: 정확히 2개 — (1) 응원/스타 → `bash "${CLAUDE_PLUGIN_ROOT}/setup/setup.sh" star yes`; (2) 괜찮아요 → `bash "${CLAUDE_PLUGIN_ROOT}/setup/setup.sh" star no`
+
+출력이 비어 있으면 조용히 넘어간다. 질문 외에는 부연하지 않는다.
+
+## Step 0.5 — 환경 온보딩 (브라우저·로그인; 선택지 기반, 막힌 단계만)
 
 먼저 Claude가 직접 실행한다(사용자에게 시키지 말 것):
 
