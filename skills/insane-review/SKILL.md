@@ -73,8 +73,14 @@ python3 <plugin>/bin/pack_and_ask.py --model pro --force-answer-after 90 \
 - 큰 콘텐츠는 **파일 첨부**로 들어간다(붙여넣기 X). 스크립트가 자동 처리.
 - 실패 시 `--retries N`으로 전송/회수를 재시도.
 
+## 채팅 정리 — 폴더명 ChatGPT 프로젝트 (기본 on)
+매 실행이 일반 채팅 목록에 쌓이지 않도록, **현재 폴더명과 같은 이름의 ChatGPT 프로젝트** 안에 채팅을 정리한다. 폴더당 프로젝트 1개로 묶여 일반 목록이 깨끗하게 유지된다.
+- 폴더명→프로젝트URL은 per-repo 캐시(`.insane-review/projects.json`)에 저장 → 다음 실행부턴 사이드바를 안 건드리고 바로 그 프로젝트로 들어간다(견고).
+- 프로젝트가 없으면 자동 생성, 있으면 재사용(중복 생성 안 함). **프로젝트 미지원 플랜이거나 UI가 바뀌어 실패해도 하드중단 없이 일반 채팅으로 폴백.**
+- 이름 바꾸려면 `--project "<이름>"`, 끄려면 `--no-project`.
+
 ## 주요 플래그
-`--target`(생략=프롬프트only) · `--include`(정밀 글롭) · `--compress` · `--model pro` · `--force-answer-after N` · `--retries N` · `--style xml|markdown|plain` · `--browser comet|chrome` · `--pack-only` · `--council`
+`--target`(생략=프롬프트only) · `--include`(정밀 글롭) · `--compress` · `--model pro` · `--force-answer-after N` · `--retries N` · `--style xml|markdown|plain` · `--browser comet|chrome` · `--project "<이름>"`(기본=폴더명) · `--no-project` · `--pack-only` · `--council`
 
 ## agent-council 멤버로 쓰기
 `references/council-setup.md` 참고. `--council` 모드는 프롬프트를 위치인자로 받고 **응답만 stdout**으로 내보내(진행로그는 stderr) council worker가 그대로 캡처한다. Pro를 웹 전용 council 멤버로 등록하면 다른 모델들과 토론에 참여시킬 수 있다.

@@ -892,6 +892,113 @@ def looks_logged_in(page) -> bool:
 
 
 # ===========================================================================
+# 3.9) ChatGPT 프로젝트 그룹핑 — 폴더명 프로젝트로 채팅 정리 (캐시→탐색→생성)
+# 일반 채팅 목록이 매 실행마다 쌓이는 걸 막고, 폴더별로 채팅을 프로젝트 안에 묶는다.
+# 프로젝트 홈 화면에도 컴포저(#prompt-textarea)·파일첨부(input[type=file])·모델 pill이
+# 그대로 있어, 프로젝트 URL로 goto만 하면 이후 첨부/모델검증/전송/회수 로직은 변경 없이 동작.
+# ===========================================================================
+def _load_project_cache(cache_path: Path) -> dict:
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_project_cache(cache_path: Path, cache: dict) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, cache_path)  # 원자적 저장
+    except Exception:
+        pass
+
+
+def project_home_ok(page, url: str) -> bool:
+    """캐시된 프로젝트 URL이 아직 살아있는지(삭제/404 아님) 확인 — 홈 이동 후 컴포저 존재."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+        return "/g/g-p-" in page.url and find_input(page) is not None
+    except Exception:
+        return False
+
+
+def find_project_url(page, name: str) -> str | None:
+    """사이드바에서 동명 프로젝트의 홈 URL을 회수(SPA 라우팅). 없으면 None.
+    프로젝트 행은 <li>, 옵션버튼 aria-label='{이름} 프로젝트 옵션 열기'로 식별."""
+    # 프로젝트 목록이 DOM에 렌더될 때까지 잠깐 대기(지연 렌더 시 중복 생성 방지)
+    for _ in range(8):
+        if page.evaluate("""() => [...document.querySelectorAll('button[aria-label]')]
+                .some(b => /프로젝트 옵션 열기/.test(b.getAttribute('aria-label') || ''))"""):
+            break
+        time.sleep(0.5)
+    clicked = page.evaluate("""(nm) => {
+        const opt = [...document.querySelectorAll('button[aria-label]')]
+            .find(b => b.getAttribute('aria-label') === nm + ' 프로젝트 옵션 열기');
+        if (!opt) return false;
+        const li = opt.closest('li') || opt.parentElement;
+        const home = li && li.querySelector('button[aria-label="프로젝트 홈 열기"]');
+        const tgt = home || li;          // 홈 버튼 우선, 없으면 행 자체 클릭
+        if (tgt) { tgt.click(); return true; }
+        return false;
+    }""", name)
+    if not clicked:
+        return None
+    try:
+        page.wait_for_url("**/g/g-p-**", wait_until="commit", timeout=8000)
+    except Exception:
+        pass
+    time.sleep(1.5)
+    return page.url if "/g/g-p-" in page.url else None
+
+
+def create_project(page, name: str) -> str | None:
+    """'새 프로젝트' 모달로 폴더명 프로젝트 생성 → 홈 URL 반환. 실패 시 None(호출자 폴백)."""
+    opened = page.evaluate("""() => { const b = [...document.querySelectorAll('button[aria-label]')]
+        .find(x => /새 프로젝트/.test(x.getAttribute('aria-label') || '')); if (b) { b.click(); return true; } return false; }""")
+    if not opened:
+        return None  # '새 프로젝트' 버튼 없음(프로젝트 미지원 플랜 등) → 일반 채팅으로 폴백
+    try:
+        # 모달의 유일한 visible text-input = 이름칸(컴포저는 contenteditable이라 input[type=text] 아님)
+        name_input = page.locator('input[type="text"]:visible').last
+        name_input.wait_for(state="visible", timeout=8000)
+        name_input.click()
+        name_input.fill(name)        # fill로 입력해야 '프로젝트 만들기' 버튼이 enabled 된다
+        time.sleep(0.4)
+        page.get_by_role("button", name="프로젝트 만들기", exact=True).click()
+        page.wait_for_url("**/g/g-p-**", wait_until="commit", timeout=15000)
+        time.sleep(2)
+        return page.url if "/g/g-p-" in page.url else None
+    except Exception:
+        try:
+            page.keyboard.press("Escape")  # 모달 닫고 폴백
+        except Exception:
+            pass
+        return None
+
+
+def ensure_project(page, name: str, cache_path: Path) -> str | None:
+    """폴더명 프로젝트의 홈 URL 확보: 캐시 → 사이드바 탐색 → 생성. 모두 실패하면 None.
+    캐시(per-repo `.insane-review/projects.json`)가 1순위라 평소엔 사이드바를 안 건드린다(견고)."""
+    cache = _load_project_cache(cache_path)
+    cached = cache.get(name)
+    if cached and project_home_ok(page, cached):
+        return cached
+    page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)  # 탐색/생성은 홈에서
+    time.sleep(2)
+    url = find_project_url(page, name)
+    if not url:
+        page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+        url = create_project(page, name)
+    if url:
+        cache[name] = url
+        _save_project_cache(cache_path, cache)
+    return url
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 def main():
@@ -916,6 +1023,10 @@ def main():
     ap.add_argument("--max-wait", type=int, default=None,
                     help=f"응답 최대 대기 초(기본 {MAX_WAIT_SECS}=20분; env INSANE_REVIEW_MAX_WAIT로도 설정)")
     ap.add_argument("--browser", default="comet", choices=["comet", "chrome"])
+    ap.add_argument("--project", default=None,
+                    help="채팅을 묶을 ChatGPT 프로젝트 이름(기본: 현재 폴더명). 폴더별로 채팅이 프로젝트 안에 정리됨")
+    ap.add_argument("--no-project", action="store_true",
+                    help="프로젝트 그룹핑 비활성화 — 일반 새 채팅으로 전송(기존 동작)")
     ap.add_argument("--pack-only", action="store_true")
     ap.add_argument("--keep-pack", action="store_true", help="전송 후 패킹 파일 보존(기본은 유지; 끄려면 --delete-pack)")
     ap.add_argument("--delete-pack", action="store_true", help="응답 회수 후 패킹 파일 삭제(시크릿 위생)")
@@ -945,6 +1056,9 @@ def main():
     out_dir = Path(args.out_dir).expanduser() if args.out_dir else OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  출력 폴더: {out_dir}")
+    # 폴더명→프로젝트URL 캐시(per-repo) — 평소엔 사이드바 안 건드리고 바로 프로젝트로 goto
+    project_cache_path = out_dir / "projects.json"
+    project_name = args.project or Path.cwd().name
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_tag = f"{ts}_{os.getpid()}_{uuid.uuid4().hex[:6]}"  # 동시 실행 충돌 방지
     pack_path = None
@@ -1018,6 +1132,21 @@ def main():
                         time.sleep(1)
                     if not looks_logged_in(page):
                         raise RuntimeError("ChatGPT 로그인 안 됨/입력창 없음 — 해당 브라우저에서 chatgpt.com 로그인 확인")
+
+                    # 프로젝트 그룹핑(기본 on): 현재 폴더명 프로젝트로 채팅을 정리(일반 채팅목록 오염 방지).
+                    # 실패해도 하드중단 X — 일반 채팅으로 폴백(프로젝트 미지원 플랜/UI 변경에 안전).
+                    if not args.no_project:
+                        proj_url = ensure_project(page, project_name, project_cache_path)
+                        if proj_url:
+                            page.goto(proj_url, wait_until="load", timeout=60000)
+                            time.sleep(2)
+                            for _ in range(10):
+                                if find_input(page):
+                                    break
+                                time.sleep(1)
+                            print(f"  🗂  프로젝트 '{project_name}'에 채팅 정리 → {proj_url}")
+                        else:
+                            print(f"  ⚠️  프로젝트 '{project_name}' 확보 실패 → 일반 채팅으로 진행(폴백)")
 
                     print(f"  현재 pill: {read_model_pills(page)}")
                     if args.model:
