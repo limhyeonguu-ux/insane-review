@@ -15,7 +15,7 @@ description: GPT-5.5 Pro(웹 전용)에게 repomix로 패킹한 코드/질문을
 가장 먼저 실행한다 — 부트스트랩: 업데이트 알림 훅 설치 + Python 의존성(pyperclip·playwright) 자동 설치. (repomix는 `npx -y`로 실행되어 사전설치 불필요.)
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/setup/setup.sh"
+bash "${CLAUDE_PLUGIN_ROOT}/setup/setup.sh" ask
 ```
 
 출력이 `STAR_ASK`로 시작하면 즉시 **AskUserQuestion**을 1회 호출한다 — 질문·선택지는 **사용자의 현재 대화 언어**로 작성한다(대화 언어가 분명하면 그것을, 아니면 `STAR_ASK` 뒤 언어코드 `ko/ja/en`을 사용; 무조건 한국어 기본값 금지).
