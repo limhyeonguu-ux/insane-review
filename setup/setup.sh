@@ -113,12 +113,18 @@ if [ ! -f "$SETUP_MARKER" ]; then
         let d={}; try{d=JSON.parse(fs.readFileSync(p,"utf8"))}catch{}
         d.hooks=d.hooks||{};
         const ss=d.hooks.SessionStart=Array.isArray(d.hooks.SessionStart)?d.hooks.SessionStart:[];
-        const has=ss.some(e=>((e&&e.hooks)||[]).some(h=>String((h&&h.command)||"").includes("gptaku-update-check")));
-        if(!has){
-          const cmd="node "+JSON.stringify(path.join(cfg,"scripts","gptaku-update-check.cjs"));
-          ss.push({matcher:"*",hooks:[{type:"command",command:cmd,timeout:5}]});
-          try{fs.writeFileSync(p,JSON.stringify(d,null,2))}catch{}
-        }
+        const cmd="node "+JSON.stringify(path.join(cfg,"scripts","gptaku-update-check.cjs"));
+        // 문자열 포함만 보면 옛/깨진 경로 hook을 "있음"으로 오인해 교정 못 한다 →
+        // 기존 gptaku-update-check hook을 찾아 command가 다르면 올바른 경로로 교정, 없으면 추가.
+        let found=false, changed=false;
+        for(const e of ss){ for(const h of ((e&&e.hooks)||[])){
+          if(h && String(h.command||"").includes("gptaku-update-check")){
+            found=true;
+            if(h.command!==cmd){ h.command=cmd; changed=true; }
+          }
+        }}
+        if(!found){ ss.push({matcher:"*",hooks:[{type:"command",command:cmd,timeout:5}]}); changed=true; }
+        if(changed){ try{fs.writeFileSync(p,JSON.stringify(d,null,2))}catch{} }
       ' >/dev/null 2>&1 || true
     fi
   fi
