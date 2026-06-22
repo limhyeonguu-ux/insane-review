@@ -16,7 +16,7 @@ description: GPT-5.5 Pro(웹 전용·API 없음)를 Claude Code 안에서 활용
 초보자는 클릭만으로 따라온다.
 
 - **deps**(`playwright`·`pyperclip`): 없으면 "지금 자동 설치" 선택 → `--check-env --install`. (`npx`/repomix는 `npx -y`로 완전 자동.)
-- **browser**: Comet/Chrome가 디버그포트(9222)로 떠 있어야 함. 없으면 "Comet 자동 실행" 선택 → Claude가 `open -a Comet --args --remote-debugging-port=9222`. (쿠키는 디스크 보존 → 로그인 유지.)
+- **browser**: 크로미움 계열 브라우저가 디버그포트(9222)에 **전용 프로필**로 떠 있어야 함(주 브라우저와 격리; Chrome 136+는 전용 프로필 없으면 CDP가 안 열림). 없으면 `--check-env`의 `BROWSERS …` 목록으로 브라우저를 고르게 한 뒤 Claude가 `pack_and_ask.py --launch-browser "<이름>"`(크로스플랫폼 mac/win/linux·전용 프로필·선택 자동 저장)을 실행. 1개뿐이면 전용 브라우저 1개 설치를 권장. (쿠키는 전용 프로필에 보존 → 로그인 유지.)
 - **login**: `--check-env`의 로그인 프로브가 `login=no`면, "방금 연 브라우저에서 chatgpt.com 로그인 + GPT-5.5 Pro 선택" 후 "로그인 완료" 선택 → 재점검. **로그인은 자동 불가 → 반드시 사용자에게 요청**(에러로 끝내지 말 것).
 - **모델 5.5 Pro**: 스크립트 `--model pro`가 자동선택·검증(`--require-model "GPT-5.5"`). 안 되면 사용자가 1회 수동 설정하면 새 채팅이 상속.
 
@@ -61,7 +61,7 @@ python3 <plugin>/bin/pack_and_ask.py --model pro --force-answer-after 90 \
 - **손실 플래그 금지**: `--compress`/`--remove-comments`/`--remove-empty-lines`는 내용을 누락시키니 리뷰엔 쓰지 않는다. 라인번호는 기본 ON(인용용).
 
 ### 4) 회수 & 반영
-- 응답은 `<plugin>/bin/out/response_*.md`에 저장되고, stdout 끝에 미리보기가 나온다.
+- 응답은 **현재 프로젝트의 `.insane-review/response_*.md`**에 저장되고, stdout 끝에 미리보기가 나온다.
 - 그 의견을 읽고 **GPT-5.5 Pro의 의견임을 명시**하여 사용자에게 반영/요약한다. 동의/이견을 너의 판단과 함께 제시하라.
 
 ## 주의/가드 (실측 기반)
@@ -80,7 +80,7 @@ python3 <plugin>/bin/pack_and_ask.py --model pro --force-answer-after 90 \
 - 이름 바꾸려면 `--project "<이름>"`, 끄려면 `--no-project`.
 
 ## 주요 플래그
-`--target`(생략=프롬프트only) · `--include`(정밀 글롭) · `--compress` · `--model pro` · `--force-answer-after N` · `--retries N` · `--style xml|markdown|plain` · `--browser comet|chrome` · `--project "<이름>"`(기본=폴더명) · `--no-project` · `--pack-only` · `--council`
+`--target`(생략=프롬프트only) · `--include`(정밀 글롭) · `--compress` · `--model pro` · `--force-answer-after N` · `--retries N` · `--style xml|markdown|plain` · `--browser <이름|경로>`(전용 프로필; 생략=config→첫 감지) · `--launch-browser <이름>`(전용 프로필 실행+저장) · `--list-browsers` · `--project "<이름>"`(기본=폴더명) · `--no-project` · `--pack-only` · `--council`
 
 ## agent-council 멤버로 쓰기
 `references/council-setup.md` 참고. `--council` 모드는 프롬프트를 위치인자로 받고 **응답만 stdout**으로 내보내(진행로그는 stderr) council worker가 그대로 캡처한다. Pro를 웹 전용 council 멤버로 등록하면 다른 모델들과 토론에 참여시킬 수 있다.

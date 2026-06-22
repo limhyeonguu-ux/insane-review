@@ -40,13 +40,21 @@ AskUserQuestion으로 물어보고 → 선택대로 Claude가 실행 → `--chec
   - "지금 자동 설치 (추천)" → Claude가 `--check-env --install` 실행
   - "직접 설치할게요" → `pip install playwright pyperclip` 안내만
   - "취소"
-- **`browser=down`** → AskUserQuestion(header `브라우저`):
-  - "Comet 자동 실행 (추천)" → Claude가 `open -a Comet --args --remote-debugging-port=9222` → 3초 대기 후 재점검
-  - "Chrome 자동 실행" → Claude가 `open -a "Google Chrome" --args --remote-debugging-port=9222`
-  - "이미 띄웠어요" → 재점검만
-  - "취소"
-- **`browser=wrong`**(포트 점유) → AskUserQuestion(header `포트충돌`): "9222를 다른 프로세스가 쓰고 있어요. 그 브라우저를 디버그포트로 다시 띄울까요?" → ["다시 띄우기"/"취소"]
-- **`login=no`** → AskUserQuestion(header `로그인`): "방금 연 브라우저에서 **chatgpt.com 로그인 + GPT-5.5 Pro 선택**을 끝낸 뒤 계속하세요."
+- **`browser=down`** → `--check-env` 출력의 `BROWSERS …`(설치된 크로미움 목록)와 `os=` 로 분기한다.
+  **항상 전용 프로필로 실행되므로 사용자 주 브라우저 세션은 건드리지 않는다.** 실행은 `open -a`가 아니라
+  `python3 "${CLAUDE_PLUGIN_ROOT}/bin/pack_and_ask.py" --launch-browser "<이름>"` (크로스플랫폼·전용 프로필·선택 자동 저장)로 한다.
+  - **2개 이상 감지** → AskUserQuestion(header `브라우저`): `BROWSERS`의 각 브라우저를 선택지로 준다. 사용자 주 브라우저로
+    추정되는 것(현재 실행 중일 가능성)엔 "메인 추정 — 가급적 다른 것" 주석. 선택 → `--launch-browser "<이름>"` → 재점검.
+  - **정확히 1개 감지**(그게 사용자 메인일 가능성↑) → AskUserQuestion(header `브라우저`):
+    - **"전용 브라우저 하나 설치 (추천)"** → 가벼운 크로미움(Chrome/Brave 등)을 자동화 전용으로 따로 설치하도록 안내
+      (ChatGPT Pro 로그인해두고 그 창은 안 건드림). 설치 후 `--launch-browser "<이름>"`.
+      *(왜: 메인과 같은 앱을 2창으로 띄우면 빈 프로필·오조작·일부 앱의 멀티인스턴스 불안정으로 혼란이 생긴다.)*
+    - **"지금 이 브라우저의 격리 프로필로 진행"** → `--launch-browser "<그 이름>"`. 전용 프로필이라 메인과 분리되지만,
+      **같은 앱 2창이라 자동화 창은 실수로 건드리지 말 것**을 한 줄 고지.
+    - "취소"
+  - **0개 감지** → AskUserQuestion(header `브라우저`): "크로미움 계열 브라우저가 없습니다 — 설치할까요?" → ["Chrome 설치 안내"/"취소"]
+- **`browser=wrong`**(포트 점유) → AskUserQuestion(header `포트충돌`): "9222를 다른 프로세스가 쓰고 있어요. 종료하고 전용 브라우저를 다시 띄울까요?" → ["다시 띄우기"(점유 프로세스 종료 안내 후 `--launch-browser`)/"취소"]
+- **`login=no`** → AskUserQuestion(header `로그인`): "방금 띄운 **전용 브라우저 창**에서 **chatgpt.com 로그인 + GPT-5.5 Pro 선택**을 끝낸 뒤 계속하세요. (전용 프로필이라 이 로그인은 계속 유지됩니다.)"
   - "로그인 완료 — 계속" → `--check-env` 재확인
   - "취소"
 - **`node=missing`** → AskUserQuestion(header `Node`): "Node.js가 필요합니다(repomix 자동설치에 사용). 설치를 도와드릴까요?" → ["brew로 설치"/"직접 설치할게요"/"취소"] (brew 선택 시 `brew install node`)
