@@ -371,8 +371,29 @@ def resolve_browser(name_or_path: str | None) -> tuple[str, str] | None:
     return bs[0] if bs else None
 
 
+def _kill_profile_browsers() -> None:
+    """전용 프로필을 점유 중인 브라우저 프로세스를 정리(크로스플랫폼 best-effort).
+    전용 프로필이라 종료해도 로그인 쿠키는 디스크에 보존된다 — 스테일 인스턴스가
+    새 런치를 흡수해(같은 user-data-dir 싱글톤) 디버그 포트가 안 열리는 교착을 푼다."""
+    target = str(BROWSER_PROFILE_DIR)
+    try:
+        if host_os() == "win":
+            ps = ("Get-CimInstance Win32_Process | "
+                  f"Where-Object {{ $_.CommandLine -like '*{target}*' }} | "
+                  "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+                  "-ErrorAction SilentlyContinue }")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=15)
+        else:
+            subprocess.run(["pkill", "-f", target], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 def launch_browser_exe(path: str) -> bool:
-    """전용 프로필 + 디버그 포트로 크로미움 직접 실행(크로스플랫폼) 후 CDP가 뜰 때까지 대기."""
+    """전용 프로필 + 디버그 포트로 크로미움 직접 실행(크로스플랫폼) 후 CDP가 뜰 때까지 대기.
+    전용 프로필에 스테일 인스턴스가 떠 있어 새 런치가 포트를 못 여는 경우(같은 user-data-dir
+    싱글톤 교착)를 감지해 그 프로세스를 정리하고 1회 재시도한다."""
     try:
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -380,19 +401,32 @@ def launch_browser_exe(path: str) -> bool:
     cmd = [path, f"--remote-debugging-port={CDP_PORT}",
            f"--user-data-dir={BROWSER_PROFILE_DIR}",
            "--no-first-run", "--no-default-browser-check"]
-    print(f"  브라우저 시작: {Path(path).name} (CDP {CDP_PORT}, 전용 프로필)")
-    try:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as exc:
-        print(f"  ❌ 실행 실패: {str(exc)[:80]}")
+
+    def _spawn_and_wait(secs: int) -> bool:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            print(f"  ❌ 실행 실패: {str(exc)[:80]}")
+            return False
+        for i in range(secs):
+            if is_port_open() and cdp_browser_ok():
+                print(f"  ✓ 시작 완료 ({i + 1}s)")
+                time.sleep(2)
+                return True
+            time.sleep(1)
         return False
-    for i in range(30):
-        if is_port_open() and cdp_browser_ok():
-            print(f"  ✓ 시작 완료 ({i + 1}s)")
-            time.sleep(2)
-            return True
-        time.sleep(1)
-    print("  ❌ 브라우저 시작 타임아웃")
+
+    print(f"  브라우저 시작: {Path(path).name} (CDP {CDP_PORT}, 전용 프로필)")
+    if _spawn_and_wait(15):
+        return True
+    # 포트 미개방 = 전용 프로필에 떠 있던 스테일 인스턴스가 런치를 흡수했을 가능성.
+    # 그 프로세스를 정리(로그인 보존)하고 싱글톤 락이 풀리길 기다린 뒤 1회 재시도.
+    print("  ⚠️  디버그 포트 미개방 — 전용 프로필 스테일 인스턴스 정리 후 재시도")
+    _kill_profile_browsers()
+    time.sleep(3)
+    if _spawn_and_wait(20):
+        return True
+    print("  ❌ 브라우저 시작 타임아웃 (전용 프로필 정리 후에도 실패)")
     return False
 
 
