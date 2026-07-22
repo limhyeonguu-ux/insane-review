@@ -116,6 +116,18 @@ ANSWER_NOW_ROW_SELECTOR = 'div[data-testid="cot-v5-pinned-row"]'
 ANSWER_NOW_TEXT_RE = re.compile(r"답변\s*받기|Get answer|answer now", re.I)
 # 최대 대기 소진 시 마지막 수단으로 '지금 답변 받기'를 누른 뒤 답변 플러시를 기다리는 추가 유예.
 FORCE_TIMEOUT_GRACE_SECS = int(os.environ.get("INSANE_REVIEW_FORCE_GRACE", "240"))
+
+# --- v0.6.0 identity 결속 ---
+# 전송이 만든 '대화 URL'(/c/<id>)에 회수를 결속한다. count 델타는 페이지가 다른 채팅을
+# 보여주는 순간 무너진다(2026-07-18 스테일 캡처 실측) — URL 결속이 1차 방어, id-diff가 2차.
+CONV_URL_RE = re.compile(r"/c/[0-9a-f]{8}[0-9a-f-]{4,}", re.I)
+CONV_URL_CAPTURE_SECS = int(os.environ.get("INSANE_REVIEW_URL_CAPTURE_SECS", "90"))
+# Pro 추론단계는 20~60분이 정상 범위(실측) — Pro 선택·검증 시 기본 최대 대기를 자동 상향.
+# 사용자가 --max-wait 또는 INSANE_REVIEW_MAX_WAIT를 명시하면 그 값이 우선.
+PRO_MAX_WAIT_SECS = int(os.environ.get("INSANE_REVIEW_PRO_MAX_WAIT", "3600"))
+# 프로젝트 그룹핑 시 이전 채팅/파일 오염 방지 한 줄(패킹 첨부 전송에만 부착).
+PROJECT_SCOPE_GUARD = ("\n\n(참고: 이번 메시지에 첨부된 파일만 근거로 답하라. "
+                       "이 프로젝트의 이전 채팅·파일은 이번 과제와 무관하다.)")
 # 첨부 실패 시 pack을 프롬프트에 인라인으로 붙여 보내는 폴백의 크기 상한(초과 시 자르지 않고 중단).
 PASTE_FALLBACK_MAX_CHARS = int(os.environ.get("INSANE_REVIEW_PASTE_MAX", "50000"))
 
@@ -719,6 +731,68 @@ def is_streaming(page) -> bool:
         return False
 
 
+def msg_id_set(page) -> set:
+    """현재 DOM의 data-message-id 집합(역할 무관, 실측 2026-07-19: 모든 메시지 노드에 존재).
+    실패 시 빈 집합 — base로 쓰일 때 빈 집합은 '아무것도 제외 안 함'이라 fail-open이 아니다
+    (URL 결속이 1차 방어이므로 id는 우리 채팅 안에서만 판정에 쓰인다)."""
+    try:
+        return set(page.eval_on_selector_all(
+            "[data-message-id]", 'els => els.map(e => e.getAttribute("data-message-id"))'))
+    except Exception:
+        return set()
+
+
+def new_assistant_text(page, base_ids: set) -> str:
+    """base_ids에 없는 '신규' assistant 턴의 텍스트(여럿이면 마지막). 없으면 ''."""
+    try:
+        nodes = page.query_selector_all(ASSISTANT_MSG_SELECTOR)
+        fresh = [n for n in nodes if (n.get_attribute("data-message-id") or "") not in base_ids]
+        return (fresh[-1].inner_text() or "") if fresh else ""
+    except Exception:
+        return ""
+
+
+def current_url(page) -> str:
+    """페이지의 '실제' 현재 URL. page.url은 로컬 캐시라 CDP 왕복 없이는 SPA pushState를
+    반영하지 못한다(실측 2026-07-23: 전송 후 30s 폴링에도 스테일, evaluate 1회로 즉시 갱신).
+    location.href 평가가 1순위, 실패 시 page.url 폴백."""
+    try:
+        return page.evaluate("() => location.href") or ""
+    except Exception:
+        try:
+            return page.url or ""
+        except Exception:
+            return ""
+
+
+def capture_conv_url(page, timeout_secs: int = CONV_URL_CAPTURE_SECS) -> str | None:
+    """전송 후 SPA가 발급하는 대화 URL(/c/<id>)을 포착. 실패 시 None(호출자 fail-closed)."""
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        u = current_url(page)
+        if CONV_URL_RE.search(u):
+            return u
+        time.sleep(1)
+    return None
+
+
+def write_run_manifest(path: Path, conv_url: str, label: str, run_tag: str,
+                       prompt_text: str, pack_path) -> None:
+    """전송 직후 대화 URL 등을 원자적으로 디스크에 기록 — stdout은 터미널 크래시에 유실되므로
+    manifest가 있어야 프로세스가 죽어도 --harvest로 항상 회수할 수 있다(2026-07-19 카운슬)."""
+    try:
+        data = {"chat_url": conv_url, "label": label, "run_tag": run_tag,
+                "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+                "pack": str(pack_path) if pack_path else None,
+                "created_at": datetime.now().astimezone().isoformat()}
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        print(f"  🧾 run manifest 기록: {path.name}")
+    except Exception:
+        pass
+
+
 def normalize(text: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip() if text else ""
 
@@ -752,11 +826,25 @@ def last_turn_complete(page, base_assistant: int = 0, base_copy: int = 0) -> boo
         return False
 
 
-def copy_last_turn(page, base_copy: int = 0) -> str | None:
+def copy_last_turn(page, base_copy: int = 0, expected: str | None = None) -> str | None:
     """새 턴의 copy 버튼을 눌러 클립보드로 회수(파이프 안전 검증 포함).
-    base_copy: 전송 전 copy 버튼 수 — 그보다 늘었을 때만(=새 응답 버튼) 회수해 이전 응답 오인을 막는다."""
+    base_copy: 전송 전 copy 버튼 수 — 그보다 늘었을 때만(=새 응답 버튼) 회수해 이전 응답 오인을 막는다.
+    expected: 해당 턴의 DOM 텍스트 — 클립보드 경합(대기 중 사용자가 다른 것을 복사) 오염 가드.
+    sentinel은 '복사 실패'만 잡고 '남의 복사'는 못 잡으므로, DOM 텍스트 중간 조각이 클립보드
+    내용에 포함되는지 대조한다. 불일치면 버리고 호출자가 DOM 텍스트로 폴백(내용 오염 < 서식 손실)."""
     if pyperclip is None:
         return None
+
+    def _matches_expected(txt: str) -> bool:
+        if not expected:
+            return True
+        exp = normalize(expected)
+        if len(exp) < 80:
+            return True  # 너무 짧으면 대조 무의미 — 통과
+        mid = len(exp) // 2
+        probe = exp[mid:mid + 30]
+        return (not probe) or (probe in normalize(txt))
+
     try:
         btns = page.query_selector_all(COPY_BTN)
         if len(btns) <= base_copy:   # 새 copy 버튼이 아직 없음 → 이전 응답 회수 방지(fail-closed)
@@ -768,7 +856,7 @@ def copy_last_turn(page, base_copy: int = 0) -> str | None:
             time.sleep(1)
             txt = pyperclip.paste()
             # sentinel이 그대로면 복사 실패 → stale 반환 방지
-            if txt and txt != "__INSANE_REVIEW_SENTINEL__" and txt.strip():
+            if txt and txt != "__INSANE_REVIEW_SENTINEL__" and txt.strip() and _matches_expected(txt):
                 return txt
             time.sleep(0.5)
         return None
@@ -1156,24 +1244,41 @@ def click_answer_now(page) -> bool:
 
 
 def wait_for_turn_response(page, force_after=None, max_wait=None,
-                           base_user: int = 0, base_assistant: int = 0, base_copy: int = 0) -> tuple[str, str]:
-    """새 user 턴(전송 전 기준개수 대비 증가) 기준 응답 회수.
-    base_user/base_assistant: 전송 직전의 메시지 수 — 이전 응답을 성공으로 오인하지 않도록 결속.
-    반환: (status, text) — status ∈ {'ok','timeout','not_sent'}."""
+                           base_user: int = 0, base_assistant: int = 0, base_copy: int = 0,
+                           conv_url: str | None = None, base_ids: set | None = None,
+                           skip_sent_check: bool = False) -> tuple[str, str, str | None]:
+    """전송이 만든 '대화 URL' + message-id에 결속해 응답을 회수(v0.6.0 identity 결속).
+    - conv_url: 이미 결속된 대화 URL(회수 재시도/harvest). None이면 전송 직후 SPA에서 포착.
+    - base_ids: 전송 직전 DOM의 data-message-id 집합 — 신규 턴을 id 차집합으로 판정.
+    - skip_sent_check: 회수 재시도/harvest 경로 — user 턴 존재를 전제(재전송 없음).
+    반환: (status, text, conv_url) — status ∈ {'ok','timeout','not_sent','sent_unknown_location'}."""
     mw = max_wait if max_wait else MAX_WAIT_SECS
     start = time.monotonic()
     last_status = 0
     force_tries = 0
 
-    # 1) 우리 user 턴이 '새로' 떴는지 확인(전송 전 기준보다 증가). 안 떴으면 not_sent → 호출자가 재전송
-    sent = False
-    while time.monotonic() - start < 25:
-        if count_msgs(page, USER_MSG_SELECTOR) > base_user:
-            sent = True
-            break
-        time.sleep(1)
-    if not sent:
-        return ("not_sent", "")
+    # 1) 우리 user 턴이 '새로' 떴는지(count 증가 또는 대화 URL 발급). 안 떴으면 not_sent → 호출자가 재전송
+    if not skip_sent_check:
+        sent = False
+        while time.monotonic() - start < 40:  # 25→40s: 첨부 처리 지연 오판→중복 전송 방지(2026-07-19 카운슬)
+            url_flipped = bool(CONV_URL_RE.search(current_url(page)))
+            if count_msgs(page, USER_MSG_SELECTOR) > base_user or url_flipped:
+                sent = True
+                break
+            time.sleep(1)
+        if not sent:
+            return ("not_sent", "", conv_url)
+
+    # 1.5) 대화 URL 결속 — 포착 실패 시 fail-closed. 어디로 갔는지 모르는 채 기다리면
+    # 스테일 캡처(2026-07-18 실측: 옛 채팅 메시지를 새 응답으로 성공 저장)가 재발하고,
+    # 재전송하면 중복 채팅이 생기므로 전용 상태로 종료해 호출자가 둘 다 하지 않게 한다.
+    if conv_url is None:
+        conv_url = capture_conv_url(page)
+        if conv_url is None:
+            return ("sent_unknown_location", "", None)
+        print(f"  🔗 대화 결속: {conv_url}")
+    _m = CONV_URL_RE.search(conv_url)
+    conv_key = _m.group(0) if _m else None
 
     # 2) assistant 턴 완료까지 대기 (stop-button 사라짐 + copy 버튼 + 텍스트 안정)
     print(f"    응답 대기 중... (최대 {mw}s"
@@ -1193,6 +1298,18 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
                 continue
             break
         elapsed = int(time.monotonic() - start)
+
+        # 결속 이탈 감지(사용자 클릭/SPA 이동 — 2026-07-18 스테일 캡처의 직접 원인) → 대화 URL로 복귀.
+        drifted = bool(conv_key) and conv_key not in current_url(page)
+        if drifted:
+            print(f"    ↩️  결속 채팅 이탈 감지({elapsed}s) → 복귀: {conv_url}")
+            try:
+                page.goto(conv_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            stable_since = None
+            time.sleep(2)
+            continue
 
         # force-answer: 성공할 때까지 매 틱 재시도(상한). 실패해도 latch 안 함.
         if force_after and elapsed >= force_after and force_tries < FORCE_MAX_TRIES and is_streaming(page):
@@ -1214,8 +1331,8 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
             time.sleep(2)
             continue
 
-        # 완료 신호 + 텍스트 안정성 (새 assistant 턴이 실제로 생겼을 때만 완료로 인정)
-        cur = last_assistant_text(page)
+        # 완료 신호 + 텍스트 안정성 — 신규 턴은 id 차집합으로 판정(base_ids 있을 때), 완료 신호는 기존 유지
+        cur = new_assistant_text(page, base_ids) if base_ids is not None else last_assistant_text(page)
         if not last_turn_complete(page, base_assistant=base_assistant, base_copy=base_copy) or not cur.strip():
             stable_since = None
             time.sleep(2)
@@ -1226,18 +1343,18 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
             time.sleep(2)
             continue
         if stable_since and (time.monotonic() - stable_since) >= STABLE_CHECK_SECS:
-            # 회수: copy 우선, 실패 시 DOM
-            txt = copy_last_turn(page, base_copy=base_copy)
+            # 회수: copy 우선(마크다운 보존), 단 DOM 텍스트와 대조해 클립보드 경합 오염을 걸러낸다.
+            txt = copy_last_turn(page, base_copy=base_copy, expected=cur)
             if txt and txt.strip():
                 print(f"    ✅ 응답 수신: {len(txt)}자 ({int(time.monotonic()-start)}s, copy)")
-                return ("ok", txt)
+                return ("ok", txt, conv_url)
             if cur and cur.strip():
                 print(f"    ✅ 응답 수신: {len(cur)}자 ({int(time.monotonic()-start)}s, DOM)")
-                return ("ok", cur)
+                return ("ok", cur, conv_url)
         time.sleep(2)
 
-    fallback = last_assistant_text(page)
-    return ("timeout", fallback) if fallback else ("timeout", "")
+    fallback = new_assistant_text(page, base_ids) if base_ids is not None else last_assistant_text(page)
+    return ("timeout", fallback, conv_url) if fallback else ("timeout", "", conv_url)
 
 
 # ===========================================================================
@@ -1478,6 +1595,8 @@ def main():
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--council", action="store_true",
                     help="agent-council 멤버 모드: 로그는 stderr, 응답만 stdout")
+    ap.add_argument("--harvest", default=None, metavar="CHAT_URL|MANIFEST",
+                    help="전송 없이 기존 대화에서 완료된 응답만 회수(타임아웃 시 안내된 대화 URL 또는 manifest_*.json 경로)")
     ap.add_argument("--retries", type=int, default=1)
     ap.add_argument("prompt_args", nargs="*", help="프롬프트(위치인자 — council 호환)")
     args = ap.parse_args()
@@ -1523,6 +1642,21 @@ def main():
     if args.require_model and not args.model:
         sys.exit('❌ --require-model은 --model과 함께 써야 합니다(모델/추론단계를 선택·검증하는 경로).\n'
                  '     예: --model pro --require-model "GPT-5.6"')
+
+    # --harvest: 전송 없이 기존 대화에서 회수만 — 패킹/프롬프트/프로젝트 진입 불필요
+    harvest_url = None
+    if args.harvest:
+        _h = Path(args.harvest).expanduser()
+        if _h.exists():
+            try:
+                harvest_url = json.loads(_h.read_text(encoding="utf-8")).get("chat_url")
+            except Exception:
+                sys.exit(f"❌ manifest 파싱 실패: {_h}")
+        else:
+            harvest_url = args.harvest
+        if not harvest_url or not CONV_URL_RE.search(harvest_url):
+            sys.exit(f"❌ --harvest 인자가 대화 URL(/c/<id>)이 아님: {args.harvest}")
+        args.target = None  # 회수 모드는 전송이 없다 — 패킹 생략
 
     real_stdout = sys.stdout
     if args.council:
@@ -1588,6 +1722,9 @@ def main():
     prompt = (args.prompt or positional
               or (Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else None)
               or DEFAULT_PROMPT)
+    if harvest_url:
+        label = "harvest"
+        prompt = f"(harvest) {harvest_url}"
 
     resolved_browser = resolve_browser(args.browser)
     bname = resolved_browser[0] if resolved_browser else (args.browser or "자동감지")
@@ -1599,9 +1736,22 @@ def main():
         save_browser_choice(resolved_browser[0])
 
     print("\n[3/3] ChatGPT 투입 & 응답 회수")
+    print("  ⚠️  회수가 끝날 때까지 전용 브라우저 창을 조작하지 마세요(이탈 시 자동 복귀하지만 오염 위험)")
     response = ""
+    conv_url = harvest_url          # 결속된 대화 URL — 있으면 이후 시도는 '회수 재시도'(재전송 금지)
+    base_ids_snapshot: set | None = (set() if harvest_url else None)
+    sent_unknown = False
+    manifest_path = out_dir / f"manifest_{label}_{run_tag}.json"
+    # Pro는 20~60분이 정상 범위 — 명시값(--max-wait/env) 없을 때만 기본 상향
+    mw_eff = args.max_wait
+    if (mw_eff is None and "INSANE_REVIEW_MAX_WAIT" not in os.environ
+            and args.model and args.model.strip().lower() == "pro"):
+        mw_eff = PRO_MAX_WAIT_SECS
+        print(f"  ⏲  Pro 추론단계 → 최대 대기 {PRO_MAX_WAIT_SECS}s 자동 상향(--max-wait/env가 우선)")
     attempts = max(1, args.retries + 1)
     for attempt in range(1, attempts + 1):
+        if response:
+            break  # 회수 경로가 continue로 성공을 들고 올라온 경우
         if attempt > 1:
             print(f"  ↻ 재시도 {attempt - 1}/{args.retries} ...")
             time.sleep(3)
@@ -1614,100 +1764,133 @@ def main():
                 page = ctx.new_page()
                 _guard_dialogs(ctx, page)
                 try:
-                    page.goto(CHATGPT_URL, wait_until="load", timeout=60000)
-                    time.sleep(3)
-                    for _ in range(10):
-                        if find_input(page):
-                            break
-                        time.sleep(1)
-                    _lst = login_state(page)
-                    if _lst != "ok":
-                        raise RuntimeError(
-                            "ChatGPT 로그인 벽 감지 — 해당 브라우저에서 chatgpt.com 로그인 확인" if _lst == "no"
-                            else "ChatGPT 컴포저 미확인(로딩 지연/CF 챌린지 가능) — 전용 브라우저 창 상태 확인 후 재시도")
-
-                    # 프로젝트 그룹핑(기본 on): 현재 폴더명 프로젝트로 채팅을 정리(일반 채팅목록 오염 방지).
-                    # 어떤 실패(예외 포함)에도 하드중단 X — 컴포저가 확인되는 일반 채팅으로 폴백(#3).
-                    if not args.no_project:
-                        proj_url = ensure_project(page, project_name, project_cache_key, project_cache_path)
-                        entered = False
-                        if proj_url:
-                            try:
-                                page.goto(proj_url, wait_until="load", timeout=60000)
-                                time.sleep(2)
-                                for _ in range(10):
-                                    if find_input(page):
-                                        break
-                                    time.sleep(1)
-                                entered = find_input(page) is not None  # 컴포저 최종 확인
-                            except Exception as pexc:
-                                print(f"  ⚠️  프로젝트 진입 예외({str(pexc)[:50]})")
-                                entered = False
-                        if entered:
-                            print(f"  🗂  프로젝트 '{project_name}'에 채팅 정리 → {proj_url}")
+                    if conv_url:
+                        # ── 회수 경로(재전송 없음): 결속된 대화 URL로 가서 이어서/다시 대기 ──
+                        # 타임아웃·예외 후 재시도와 --harvest가 모두 이 경로 — 중복 채팅 생성 원천 차단.
+                        print(f"  🔁 회수 모드(재전송 없음): {conv_url}")
+                        page.goto(conv_url, wait_until="load", timeout=60000)
+                        time.sleep(2)
+                        if login_state(page) == "no":
+                            raise RuntimeError("ChatGPT 로그인 벽 감지 — 해당 브라우저에서 chatgpt.com 로그인 확인")
+                        status, text, conv_url = wait_for_turn_response(
+                            page, force_after=args.force_answer_after, max_wait=mw_eff,
+                            conv_url=conv_url, base_ids=base_ids_snapshot, skip_sent_check=True)
+                        if status == "timeout":
+                            print(f"  ⚠️  타임아웃 — 다음 시도도 같은 채팅 회수 재시도: {conv_url}")
+                            continue
+                        if status == "ok" and text and text.strip():
+                            response = text
                         else:
-                            # 폴백: 프로젝트 미확보/진입 실패 모두 일반 채팅으로(컴포저 보장)
-                            print(f"  ⚠️  프로젝트 '{project_name}' 사용 불가 → 일반 채팅으로 진행(폴백)")
-                            try:
-                                page.goto(CHATGPT_URL, wait_until="load", timeout=60000)
-                                time.sleep(2)
-                                for _ in range(10):
-                                    if find_input(page):
-                                        break
-                                    time.sleep(1)
-                            except Exception:
-                                pass
-
-                    print(f"  현재 pill: {read_model_pills(page)}")
-                    if args.model:
-                        print(f"  모델/추론단계 선택: '{args.model}'"
-                               + (f" (모델명 검증='{args.require_model}')" if args.require_model else ""))
-                        verified, v_name = select_model(page, args.model, require_model=args.require_model)
-                        if not verified:
-                            raise RuntimeError(f"모델/추론단계 검증 실패 (model={args.model}, require={args.require_model}) — 전송 중단")
-                        verified_model_name = v_name
-
-                    # 본문은 '첨부'가 기본. 첨부 실패 시:
-                    #  - --attach면 fail-closed(중단)
-                    #  - 아니면 pack이 상한 내일 때만 프롬프트에 인라인 붙여 폴백, 초과면 fail-closed(잘린 전송 방지)
-                    send_prompt = prompt
-                    if pack_path is not None and not attach_file(page, pack_path):
-                        if args.attach:
-                            raise RuntimeError("코드 첨부 확인 실패 + --attach(첨부 강제) → 중단(fail-closed)")
-                        send_prompt = build_paste_fallback(prompt, pack_path)
-                        if send_prompt is None:
-                            raise RuntimeError("코드 첨부 실패 + pack이 커서 붙여넣기 폴백 불가 → 중단(fail-closed)")
-                        print(f"  ↩︎  첨부 실패 → pack을 프롬프트에 인라인 붙여넣기 폴백({len(send_prompt):,}자, 상한 내)")
-
-                    # 전송 직전 기준개수 포착(턴-스코프 결속 — 이전 응답을 성공으로 오인 방지).
-                    # 조회 실패를 0으로 숨기면 기존 DOM이 '새 턴'으로 오인되므로 fail-closed 카운터 사용.
-                    base_user = count_msgs_strict(page, USER_MSG_SELECTOR)
-                    base_assistant = count_msgs_strict(page, ASSISTANT_MSG_SELECTOR)
-                    base_copy = count_msgs_strict(page, COPY_BTN)
-
-                    put_text(page, send_prompt)
-                    # 보낼 텍스트 '전체'가 입력창에 들어갔는지 검증 — 아니면 composer 비우고 1회 재입력, 그래도 불일치면 중단
-                    # (첨부만/잘린 질문이 전송되어 '오염된 응답'을 성공저장하는 fail-open 차단)
-                    if not composer_has_prompt(page, send_prompt):
-                        clear_composer(page)
-                        put_text(page, send_prompt)
-                        if not composer_has_prompt(page, send_prompt):
-                            raise RuntimeError("프롬프트가 입력창에 온전히 안 들어감 → 중단(첨부만/잘린 전송 방지, fail-closed)")
-                    click_send(page)
-                    status, text = wait_for_turn_response(page, force_after=args.force_answer_after,
-                                                          max_wait=args.max_wait,
-                                                          base_user=base_user, base_assistant=base_assistant,
-                                                          base_copy=base_copy)
-                    if status == "not_sent":
-                        print("  ⚠️  user 턴 미생성(전송 안 됨) → 재시도")
-                        continue
-                    if status == "timeout":
-                        print("  ⚠️  타임아웃 — 미완성 응답은 성공저장 안 함(fail-closed) → 재시도")
-                        continue
-                    if status == "ok" and text and text.strip():
-                        response = text
+                            print(f"  ⚠️  응답 비었거나 너무 짧음(status={status}) → 회수 재시도")
+                        continue  # 회수 경로 종결(전송 경로 진입 금지) — 성공 시 루프 상단에서 break
                     else:
-                        print(f"  ⚠️  응답 비었거나 너무 짧음(status={status}) → 재시도")
+                        page.goto(CHATGPT_URL, wait_until="load", timeout=60000)
+                        time.sleep(3)
+                        for _ in range(10):
+                            if find_input(page):
+                                break
+                            time.sleep(1)
+                        _lst = login_state(page)
+                        if _lst != "ok":
+                            raise RuntimeError(
+                                "ChatGPT 로그인 벽 감지 — 해당 브라우저에서 chatgpt.com 로그인 확인" if _lst == "no"
+                                else "ChatGPT 컴포저 미확인(로딩 지연/CF 챌린지 가능) — 전용 브라우저 창 상태 확인 후 재시도")
+
+                        # 프로젝트 그룹핑(기본 on): 현재 폴더명 프로젝트로 채팅을 정리(일반 채팅목록 오염 방지).
+                        # 어떤 실패(예외 포함)에도 하드중단 X — 컴포저가 확인되는 일반 채팅으로 폴백(#3).
+                        if not args.no_project:
+                            proj_url = ensure_project(page, project_name, project_cache_key, project_cache_path)
+                            entered = False
+                            if proj_url:
+                                try:
+                                    page.goto(proj_url, wait_until="load", timeout=60000)
+                                    time.sleep(2)
+                                    for _ in range(10):
+                                        if find_input(page):
+                                            break
+                                        time.sleep(1)
+                                    entered = find_input(page) is not None  # 컴포저 최종 확인
+                                except Exception as pexc:
+                                    print(f"  ⚠️  프로젝트 진입 예외({str(pexc)[:50]})")
+                                    entered = False
+                            if entered:
+                                print(f"  🗂  프로젝트 '{project_name}'에 채팅 정리 → {proj_url}")
+                            else:
+                                # 폴백: 프로젝트 미확보/진입 실패 모두 일반 채팅으로(컴포저 보장)
+                                print(f"  ⚠️  프로젝트 '{project_name}' 사용 불가 → 일반 채팅으로 진행(폴백)")
+                                try:
+                                    page.goto(CHATGPT_URL, wait_until="load", timeout=60000)
+                                    time.sleep(2)
+                                    for _ in range(10):
+                                        if find_input(page):
+                                            break
+                                        time.sleep(1)
+                                except Exception:
+                                    pass
+
+                        print(f"  현재 pill: {read_model_pills(page)}")
+                        if args.model:
+                            print(f"  모델/추론단계 선택: '{args.model}'"
+                                   + (f" (모델명 검증='{args.require_model}')" if args.require_model else ""))
+                            verified, v_name = select_model(page, args.model, require_model=args.require_model)
+                            if not verified:
+                                raise RuntimeError(f"모델/추론단계 검증 실패 (model={args.model}, require={args.require_model}) — 전송 중단")
+                            verified_model_name = v_name
+
+                        # 본문은 '첨부'가 기본. 첨부 실패 시:
+                        #  - --attach면 fail-closed(중단)
+                        #  - 아니면 pack이 상한 내일 때만 프롬프트에 인라인 붙여 폴백, 초과면 fail-closed(잘린 전송 방지)
+                        send_prompt = prompt
+                        if pack_path is not None:
+                            if attach_file(page, pack_path):
+                                if not args.no_project:
+                                    # 같은 프로젝트의 옛 채팅/파일을 근거로 쓰는 오염 방지(2026-07-19 카운슬 P2)
+                                    send_prompt = prompt + PROJECT_SCOPE_GUARD
+                            else:
+                                if args.attach:
+                                    raise RuntimeError("코드 첨부 확인 실패 + --attach(첨부 강제) → 중단(fail-closed)")
+                                send_prompt = build_paste_fallback(prompt, pack_path)
+                                if send_prompt is None:
+                                    raise RuntimeError("코드 첨부 실패 + pack이 커서 붙여넣기 폴백 불가 → 중단(fail-closed)")
+                                print(f"  ↩︎  첨부 실패 → pack을 프롬프트에 인라인 붙여넣기 폴백({len(send_prompt):,}자, 상한 내)")
+
+                        # 전송 직전 기준 포착(턴-스코프 결속): fail-closed 카운터 + message-id 집합(id-diff 판정용)
+                        base_user = count_msgs_strict(page, USER_MSG_SELECTOR)
+                        base_assistant = count_msgs_strict(page, ASSISTANT_MSG_SELECTOR)
+                        base_copy = count_msgs_strict(page, COPY_BTN)
+                        base_ids_snapshot = msg_id_set(page)
+
+                        put_text(page, send_prompt)
+                        # 보낼 텍스트 '전체'가 입력창에 들어갔는지 검증 — 아니면 composer 비우고 1회 재입력, 그래도 불일치면 중단
+                        # (첨부만/잘린 질문이 전송되어 '오염된 응답'을 성공저장하는 fail-open 차단)
+                        if not composer_has_prompt(page, send_prompt):
+                            clear_composer(page)
+                            put_text(page, send_prompt)
+                            if not composer_has_prompt(page, send_prompt):
+                                raise RuntimeError("프롬프트가 입력창에 온전히 안 들어감 → 중단(첨부만/잘린 전송 방지, fail-closed)")
+                        click_send(page)
+                        status, text, conv_url = wait_for_turn_response(
+                            page, force_after=args.force_answer_after, max_wait=mw_eff,
+                            base_user=base_user, base_assistant=base_assistant,
+                            base_copy=base_copy, base_ids=base_ids_snapshot)
+                        if conv_url:
+                            # 전송 직후 디스크 영속화 — 프로세스가 죽어도 --harvest로 회수 가능(카운슬 P0 승격)
+                            write_run_manifest(manifest_path, conv_url, label, run_tag, send_prompt, pack_path)
+                        if status == "not_sent":
+                            print("  ⚠️  user 턴 미생성(전송 안 됨) → 재시도(재전송)")
+                            continue
+                        if status == "sent_unknown_location":
+                            print("  ⚠️  전송은 확인됐지만 대화 URL 포착 실패 — 중복 전송 방지를 위해 재전송하지 않고 종료")
+                            sent_unknown = True
+                            break
+                        if status == "timeout":
+                            print("  ⚠️  타임아웃 — 미완성 응답은 성공저장 안 함(fail-closed)"
+                                  + (f" → 다음 시도는 같은 채팅 회수 재시도: {conv_url}" if conv_url else " → 재시도"))
+                            continue
+                        if status == "ok" and text and text.strip():
+                            response = text
+                        else:
+                            print(f"  ⚠️  응답 비었거나 너무 짧음(status={status}) → 재시도")
                 finally:
                     try:
                         page.close()
@@ -1719,8 +1902,18 @@ def main():
         except Exception as exc:
             print(f"  ⚠️  시도 {attempt} 실패: {str(exc)[:160]}")
 
+    if sent_unknown:
+        sys.exit("❌ 전송은 됐지만 대화 URL 미포착(sent-unknown-location) — 중복 방지 위해 재전송 안 함.\n"
+                 "   ChatGPT 프로젝트에서 방금 생긴 채팅을 찾아 다음으로 회수하세요:\n"
+                 "   pack_and_ask.py --harvest '<채팅URL>'")
     if not response:
-        sys.exit("❌ 응답 회수 실패 (모든 재시도 소진)")
+        hint = (f"\n   결속 채팅: {conv_url}\n   나중에 회수: pack_and_ask.py --harvest '{conv_url}'"
+                if conv_url else "")
+        sys.exit("❌ 응답 회수 실패 (모든 재시도 소진)" + hint)
+
+    # 회수 품질 경고(하드 차단 아님 — 카운슬 합의로 경고 강등): 파일-저장형/단답 응답 의심 패턴
+    if len(response) < 500 and re.search(r"저장했습니다|다운로드|sandbox:/", response):
+        print("  ⚠️  응답이 짧고 파일-저장형 패턴 포함 — 본문 대신 파일로 저장됐을 수 있음(채팅에서 직접 확인 권장)")
 
     # 패킹 파일 시크릿 위생: --delete-pack이면 삭제
     if pack_path is not None and args.delete_pack:
