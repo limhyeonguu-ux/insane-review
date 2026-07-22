@@ -111,6 +111,11 @@ MIN_WAIT_SECS = 20
 STABLE_CHECK_SECS = 8
 STATUS_INTERVAL = 15
 FORCE_MAX_TRIES = 6    # force-answer 클릭 재시도 상한
+# '지금 답변 받기' 버튼(cot v5 UI, 실측 2026-07-19): 본문 리즈닝 고정행 안의 button.
+ANSWER_NOW_ROW_SELECTOR = 'div[data-testid="cot-v5-pinned-row"]'
+ANSWER_NOW_TEXT_RE = re.compile(r"답변\s*받기|Get answer|answer now", re.I)
+# 최대 대기 소진 시 마지막 수단으로 '지금 답변 받기'를 누른 뒤 답변 플러시를 기다리는 추가 유예.
+FORCE_TIMEOUT_GRACE_SECS = int(os.environ.get("INSANE_REVIEW_FORCE_GRACE", "240"))
 # 첨부 실패 시 pack을 프롬프트에 인라인으로 붙여 보내는 폴백의 크기 상한(초과 시 자르지 않고 중단).
 PASTE_FALLBACK_MAX_CHARS = int(os.environ.get("INSANE_REVIEW_PASTE_MAX", "50000"))
 
@@ -1077,9 +1082,36 @@ def click_send(page) -> bool:
 
 def click_answer_now(page) -> bool:
     """리즈닝 중 '지금 답변 받기'를 눌러 강제 답변.
-    실측: 버튼은 리즈닝 flyout 최상단(우측 패널). 패널이 아래로 스크롤되면 버튼이 밀려나므로
-    스크롤 컨테이너를 top으로 올린 뒤 scroll_into_view 후 클릭한다.
+    실측 2026-07-19(cot v5 UI): 버튼은 우측 flyout이 아니라 본문 리즈닝 고정행
+    (div[data-testid="cot-v5-pinned-row"]) 안의 button. 이 행은 TransitionGroup
+    애니메이션 속이라 Playwright 안정성 판정이 타임아웃될 수 있어 force 클릭 폴백을 둔다.
+    구 UI(우측 flyout) 대비 텍스트 매칭 경로는 폴백으로 유지.
     칩 매칭은 '생각 중'으로 좁힌다 — 프롬프트 본문의 '추론' 등과 오매칭 방지."""
+    # 1) 신 UI: 고정행 셀렉터 직행(스크롤 조작 불필요 — 요소 단위 scroll_into_view만)
+    try:
+        row = page.query_selector(ANSWER_NOW_ROW_SELECTOR)
+        if row:
+            btns = [b for b in row.query_selector_all("button") if b.is_visible()]
+            target = next((b for b in btns if ANSWER_NOW_TEXT_RE.search(b.inner_text() or "")),
+                          btns[0] if len(btns) == 1 else None)
+            if target:
+                try:
+                    target.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                try:
+                    target.click(timeout=2500)
+                    return True
+                except Exception:
+                    try:
+                        target.click(force=True)  # 애니메이션 중 안정성 판정 실패 대비
+                        return True
+                    except Exception:
+                        pass  # 셀렉터 경로 실패 → 아래 텍스트 매칭 폴백
+    except Exception:
+        pass
+
+    # 2) 구 UI 폴백: 텍스트 매칭(+ 리즈닝 칩 열기)
     answer_pats = [("지금 답변 받기", True), ("지금 답변받기", True),
                    ("답변 받기", False), ("Get answer", False), ("answer now", False)]
     chip_re = re.compile(r"생각\s*중|Thinking", re.I)
@@ -1101,7 +1133,10 @@ def click_answer_now(page) -> bool:
                         loc.first.scroll_into_view_if_needed(timeout=2000)
                     except Exception:
                         pass
-                    loc.first.click(timeout=2500)
+                    try:
+                        loc.first.click(timeout=2500)
+                    except Exception:
+                        loc.first.click(force=True, timeout=2500)  # 애니메이션 안정성 판정 실패 대비
                     return True
             except Exception:
                 continue
@@ -1145,7 +1180,18 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
           + (f", {force_after}s 후 '지금 답변 받기' 재시도" if force_after else "") + ")")
     stable_since = None
     last_text = ""
-    while time.monotonic() - start < mw:
+    deadline = start + mw
+    grace_used = False
+    while True:
+        if time.monotonic() >= deadline:
+            # 최대 대기 소진 — 아직 리즈닝 중이면 마지막 수단으로 '지금 답변 받기'를 눌러
+            # 답변을 플러시시키고 1회에 한해 추가 유예를 준다(실패로 버리는 것보다 회수가 낫다).
+            if not grace_used and is_streaming(page) and click_answer_now(page):
+                grace_used = True
+                deadline = time.monotonic() + FORCE_TIMEOUT_GRACE_SECS
+                print(f"    ⏰ 최대 대기 소진 — 마지막 수단 '지금 답변 받기' 클릭 → {FORCE_TIMEOUT_GRACE_SECS}s 추가 대기")
+                continue
+            break
         elapsed = int(time.monotonic() - start)
 
         # force-answer: 성공할 때까지 매 틱 재시도(상한). 실패해도 latch 안 함.
