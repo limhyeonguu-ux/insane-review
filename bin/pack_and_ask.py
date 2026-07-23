@@ -95,10 +95,68 @@ def _guard_dialogs(ctx, page=None):
 
 INPUT_SELECTORS = ["#prompt-textarea", 'div[contenteditable="true"]']
 FILE_INPUT_SELECTOR = 'input[type="file"]'
-COPY_BTN = 'button[data-testid="copy-turn-action-button"]'
-STREAMING_BTN = 'button[data-testid="stop-button"]'
-USER_MSG_SELECTOR = '[data-message-author-role="user"]'
-ASSISTANT_MSG_SELECTOR = '[data-message-author-role="assistant"]'
+# 폴백 리스트(첫 항목=현행 실측 셀렉터, 이후=구조적 폴백) — INPUT_SELECTORS와 같은 컨벤션
+COPY_BTN_SELECTORS = [
+    'button[data-testid="copy-turn-action-button"]',
+    'button[aria-label="Copy"]',
+    'button[data-testid*="copy"]',
+]
+STREAMING_BTN_SELECTORS = [
+    'button[data-testid="stop-button"]',
+    'button[aria-label="Stop streaming"]',
+    'button[data-testid*="stop"]',
+]
+USER_MSG_SELECTORS = ['[data-message-author-role="user"]', 'article[data-turn="user"]']
+ASSISTANT_MSG_SELECTORS = ['[data-message-author-role="assistant"]', 'article[data-turn="assistant"]']
+
+# 사용량 한도(쿼터) 차단 배너 감지 문구 — dialog/alert 표면에서만 대조(오탐 방지). 자유롭게 추가.
+QUOTA_HINTS = [
+    "usage limit", "reached your limit", "limit reached", "you've hit",
+    "reached the current usage cap", "try again later", "upgrade to",
+    "사용량 한도", "한도에 도달", "사용 한도", "요금제를 업그레이드",
+]
+
+
+def _q(page, selectors):
+    """폴백 리스트에서 첫 매치 노드(없으면 None)."""
+    for sel in selectors:
+        try:
+            node = page.query_selector(sel)
+        except Exception:
+            continue
+        if node is not None:
+            return node
+    return None
+
+
+def _qa(page, selectors):
+    """폴백 리스트에서 첫 비어있지 않은 query_selector_all 결과(없으면 [])."""
+    for sel in selectors:
+        try:
+            nodes = page.query_selector_all(sel)
+        except Exception:
+            continue
+        if nodes:
+            return nodes
+    return []
+
+
+def detect_quota_block(page):
+    """쿼터/한도 차단 감지(보수적 — role=dialog/alert 표면만 스캔, 본문 응답 텍스트는 안 봄).
+    매칭된 문구를 반환, 없으면 None. 실패는 조용히 None(대기 루프를 깨지 않음)."""
+    try:
+        for sel in ('[role="dialog"]', '[role="alert"]'):
+            for node in page.query_selector_all(sel):
+                txt = (node.inner_text() or "").strip()
+                if not txt:
+                    continue
+                low = txt.lower()
+                for hint in QUOTA_HINTS:
+                    if hint.lower() in low:
+                        return txt[:200]
+    except Exception:
+        return None
+    return None
 LOGIN_WALL_SELECTORS = [
     'button[data-testid="login-button"]',
     'a[href*="auth/login"]',
@@ -704,29 +762,45 @@ def find_input(page):
     return None
 
 
-def count_msgs(page, selector: str) -> int:
-    try:
-        return len(page.query_selector_all(selector))
-    except Exception:
-        return 0
+def count_msgs(page, selectors) -> int:
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    for sel in selectors:
+        try:
+            n = len(page.query_selector_all(sel))
+        except Exception:
+            continue
+        if n:
+            return n
+    return 0
 
 
-def count_msgs_strict(page, selector: str) -> int:
+def count_msgs_strict(page, selectors) -> int:
     """기준개수 포착 전용 — 조회 실패를 0으로 숨기지 않는다. 재시도 후에도 실패하면 예외(fail-closed).
     base_* 가 조회실패로 0이 되면 기존 DOM이 '새 턴'으로 오인돼 이전 답변을 저장할 수 있으므로 이를 차단한다."""
+    if isinstance(selectors, str):
+        selectors = [selectors]
     last_exc = None
     for _ in range(3):
-        try:
-            return len(page.query_selector_all(selector))
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(0.3)
-    raise RuntimeError(f"기준 메시지 수 조회 실패({selector}): {str(last_exc)[:60]} → 전송 중단(fail-closed)")
+        got_zero_cleanly = True
+        for sel in selectors:
+            try:
+                n = len(page.query_selector_all(sel))
+            except Exception as exc:
+                last_exc = exc
+                got_zero_cleanly = False
+                continue
+            if n:
+                return n
+        if got_zero_cleanly:
+            return 0  # 전 셀렉터 조회 성공·전부 0 — 실제로 없음
+        time.sleep(0.3)
+    raise RuntimeError(f"기준 메시지 수 조회 실패({selectors}): {str(last_exc)[:60]} → 전송 중단(fail-closed)")
 
 
 def is_streaming(page) -> bool:
     try:
-        return page.query_selector(STREAMING_BTN) is not None
+        return _q(page, STREAMING_BTN_SELECTORS) is not None
     except Exception:
         return False
 
@@ -745,7 +819,7 @@ def msg_id_set(page) -> set:
 def new_assistant_text(page, base_ids: set) -> str:
     """base_ids에 없는 '신규' assistant 턴의 텍스트(여럿이면 마지막). 없으면 ''."""
     try:
-        nodes = page.query_selector_all(ASSISTANT_MSG_SELECTOR)
+        nodes = _qa(page, ASSISTANT_MSG_SELECTORS)
         fresh = [n for n in nodes if (n.get_attribute("data-message-id") or "") not in base_ids]
         return (fresh[-1].inner_text() or "") if fresh else ""
     except Exception:
@@ -798,7 +872,7 @@ def normalize(text: str | None) -> str:
 
 
 def last_assistant_node(page):
-    nodes = page.query_selector_all(ASSISTANT_MSG_SELECTOR)
+    nodes = _qa(page, ASSISTANT_MSG_SELECTORS)
     return nodes[-1] if nodes else None
 
 
@@ -819,9 +893,9 @@ def last_turn_complete(page, base_assistant: int = 0, base_copy: int = 0) -> boo
         return False
     try:
         # 전송 전보다 assistant 노드·copy 버튼이 늘지 않았으면 '이전 응답'이므로 완료로 보지 않음(fail-closed)
-        if count_msgs(page, ASSISTANT_MSG_SELECTOR) <= base_assistant:
+        if count_msgs(page, ASSISTANT_MSG_SELECTORS) <= base_assistant:
             return False
-        return len(page.query_selector_all(COPY_BTN)) > base_copy
+        return len(_qa(page, COPY_BTN_SELECTORS)) > base_copy
     except Exception:
         return False
 
@@ -846,7 +920,7 @@ def copy_last_turn(page, base_copy: int = 0, expected: str | None = None) -> str
         return (not probe) or (probe in normalize(txt))
 
     try:
-        btns = page.query_selector_all(COPY_BTN)
+        btns = _qa(page, COPY_BTN_SELECTORS)
         if len(btns) <= base_copy:   # 새 copy 버튼이 아직 없음 → 이전 응답 회수 방지(fail-closed)
             return None
         btn = btns[-1]  # 증가가 확인됐으므로 마지막이 새 응답의 copy 버튼
@@ -1251,7 +1325,7 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
     - conv_url: 이미 결속된 대화 URL(회수 재시도/harvest). None이면 전송 직후 SPA에서 포착.
     - base_ids: 전송 직전 DOM의 data-message-id 집합 — 신규 턴을 id 차집합으로 판정.
     - skip_sent_check: 회수 재시도/harvest 경로 — user 턴 존재를 전제(재전송 없음).
-    반환: (status, text, conv_url) — status ∈ {'ok','timeout','not_sent','sent_unknown_location'}."""
+    반환: (status, text, conv_url) — status ∈ {'ok','timeout','not_sent','sent_unknown_location','quota'}."""
     mw = max_wait if max_wait else MAX_WAIT_SECS
     start = time.monotonic()
     last_status = 0
@@ -1262,7 +1336,7 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
         sent = False
         while time.monotonic() - start < 40:  # 25→40s: 첨부 처리 지연 오판→중복 전송 방지(2026-07-19 카운슬)
             url_flipped = bool(CONV_URL_RE.search(current_url(page)))
-            if count_msgs(page, USER_MSG_SELECTOR) > base_user or url_flipped:
+            if count_msgs(page, USER_MSG_SELECTORS) > base_user or url_flipped:
                 sent = True
                 break
             time.sleep(1)
@@ -1334,6 +1408,10 @@ def wait_for_turn_response(page, force_after=None, max_wait=None,
         # 완료 신호 + 텍스트 안정성 — 신규 턴은 id 차집합으로 판정(base_ids 있을 때), 완료 신호는 기존 유지
         cur = new_assistant_text(page, base_ids) if base_ids is not None else last_assistant_text(page)
         if not last_turn_complete(page, base_assistant=base_assistant, base_copy=base_copy) or not cur.strip():
+            quota_msg = detect_quota_block(page)
+            if quota_msg:
+                print(f"    ⛔ 사용량 한도 감지 → 대기 중단: {quota_msg[:80]}")
+                return ("quota", "", conv_url)
             stable_since = None
             time.sleep(2)
             continue
@@ -1741,6 +1819,7 @@ def main():
     conv_url = harvest_url          # 결속된 대화 URL — 있으면 이후 시도는 '회수 재시도'(재전송 금지)
     base_ids_snapshot: set | None = (set() if harvest_url else None)
     sent_unknown = False
+    quota_hit = False
     manifest_path = out_dir / f"manifest_{label}_{run_tag}.json"
     # Pro는 20~60분이 정상 범위 — 명시값(--max-wait/env) 없을 때만 기본 상향
     mw_eff = args.max_wait
@@ -1775,6 +1854,9 @@ def main():
                         status, text, conv_url = wait_for_turn_response(
                             page, force_after=args.force_answer_after, max_wait=mw_eff,
                             conv_url=conv_url, base_ids=base_ids_snapshot, skip_sent_check=True)
+                        if status == "quota":
+                            print("  ⛔ 사용량 한도 감지 — 회수 재시도 중단(한도 해제 후 --harvest 재실행)")
+                            break
                         if status == "timeout":
                             print(f"  ⚠️  타임아웃 — 다음 시도도 같은 채팅 회수 재시도: {conv_url}")
                             continue
@@ -1855,9 +1937,9 @@ def main():
                                 print(f"  ↩︎  첨부 실패 → pack을 프롬프트에 인라인 붙여넣기 폴백({len(send_prompt):,}자, 상한 내)")
 
                         # 전송 직전 기준 포착(턴-스코프 결속): fail-closed 카운터 + message-id 집합(id-diff 판정용)
-                        base_user = count_msgs_strict(page, USER_MSG_SELECTOR)
-                        base_assistant = count_msgs_strict(page, ASSISTANT_MSG_SELECTOR)
-                        base_copy = count_msgs_strict(page, COPY_BTN)
+                        base_user = count_msgs_strict(page, USER_MSG_SELECTORS)
+                        base_assistant = count_msgs_strict(page, ASSISTANT_MSG_SELECTORS)
+                        base_copy = count_msgs_strict(page, COPY_BTN_SELECTORS)
                         base_ids_snapshot = msg_id_set(page)
 
                         put_text(page, send_prompt)
@@ -1883,6 +1965,10 @@ def main():
                             print("  ⚠️  전송은 확인됐지만 대화 URL 포착 실패 — 중복 전송 방지를 위해 재전송하지 않고 종료")
                             sent_unknown = True
                             break
+                        if status == "quota":
+                            print("  ⛔ 사용량 한도 — 재시도 무의미, 중단(재전송 없음)")
+                            quota_hit = True
+                            break
                         if status == "timeout":
                             print("  ⚠️  타임아웃 — 미완성 응답은 성공저장 안 함(fail-closed)"
                                   + (f" → 다음 시도는 같은 채팅 회수 재시도: {conv_url}" if conv_url else " → 재시도"))
@@ -1902,6 +1988,10 @@ def main():
         except Exception as exc:
             print(f"  ⚠️  시도 {attempt} 실패: {str(exc)[:160]}")
 
+    if quota_hit:
+        hint = (f"\n   결속 채팅: {conv_url}\n   한도 해제 후 회수 시도: pack_and_ask.py --harvest '{conv_url}'"
+                if conv_url else "")
+        sys.exit("❌ ChatGPT 사용량 한도 도달 — 대기·재시도 중단(응답 미생성)." + hint)
     if sent_unknown:
         sys.exit("❌ 전송은 됐지만 대화 URL 미포착(sent-unknown-location) — 중복 방지 위해 재전송 안 함.\n"
                  "   ChatGPT 프로젝트에서 방금 생긴 채팅을 찾아 다음으로 회수하세요:\n"
